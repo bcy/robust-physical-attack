@@ -22,7 +22,7 @@ from shapeshifter import create_textures
 from shapeshifter import create_attack
 from shapeshifter import create_evaluation
 from shapeshifter import batch_accumulate
-from shapeshifter import plot
+#from shapeshifter import plot
 
 def main():
     # Parse args
@@ -414,6 +414,7 @@ def create_composited_images(batch_size, textures, masks, interpolation='BILINEA
 
     return input_images_
 
+"""
 def _apply_blur(image):
     image_ = tf.expand_dims(image, axis=0)
 
@@ -440,6 +441,7 @@ def _apply_blur(image):
     image_ = tf.nn.conv2d(image_, vertical_blur_kernel_, [1, 1, 1, 1], 'SAME')
 
     return image_[0]
+"""
 
 def generate_data(count, backgrounds, objects, objects_masks, objects_class, objects_transforms, textures_transforms, seed=None):
     if seed:
@@ -556,7 +558,8 @@ def generate_transforms(origin, count,
     transforms = []
 
     for yaw, pitch, roll, x, y, z in zip(yaws, pitchs, rolls, xs, ys, zs):
-        transform = get_transform(origin, x_shift=x, y_shift=y, im_scale=z, rot_in_degrees=roll)
+        #transform = get_transform(origin, x_shift=x, y_shift=y, im_scale=z, rot_in_degrees=roll)
+        transform = get_transform3d(origin, x_shift=x, y_shift=y, im_scale=z, yaw=yaw, pitch=pitch, roll=roll)
         transforms.append(transform)
 
     transforms = np.array(transforms).astype(np.float32)
@@ -611,6 +614,65 @@ def get_transform(origin, x_shift, y_shift, im_scale, rot_in_degrees):
 
     # Return these values in the order that tf.contrib.image.transform expects
     return np.array([a0, a1, a2, b0, b1, b2, 0, 0]).astype(np.float32)
+
+def get_M(width, height, focal, theta, phi, gamma, dx, dy, dz):
+
+        w = width
+        h = height
+        f = focal
+
+        # Projection 2D -> 3D matrix
+        A1 = np.array([ [1, 0, -w/2],
+                        [0, 1, -h/2],
+                        [0, 0, 1],
+                        [0, 0, 1]])
+
+        # Rotation matrices around the X, Y, and Z axis
+        RX = np.array([ [1, 0, 0, 0],
+                        [0, np.cos(theta), -np.sin(theta), 0],
+                        [0, np.sin(theta), np.cos(theta), 0],
+                        [0, 0, 0, 1]])
+
+        RY = np.array([ [np.cos(phi), 0, -np.sin(phi), 0],
+                        [0, 1, 0, 0],
+                        [np.sin(phi), 0, np.cos(phi), 0],
+                        [0, 0, 0, 1]])
+
+        RZ = np.array([ [np.cos(gamma), -np.sin(gamma), 0, 0],
+                        [np.sin(gamma), np.cos(gamma), 0, 0],
+                        [0, 0, 1, 0],
+                        [0, 0, 0, 1]])
+
+        # Composed rotation matrix with (RX, RY, RZ)
+        R = np.dot(np.dot(RX, RY), RZ)
+
+        # Translation matrix
+        T = np.array([  [1, 0, 0, dx],
+                        [0, 1, 0, dy],
+                        [0, 0, 1, dz],
+                        [0, 0, 0, 1]])
+
+        # Projection 3D -> 2D matrix
+        A2 = np.array([ [f, 0, w/2, 0],
+                        [0, f, h/2, 0],
+                        [0, 0, 1, 0]])
+
+        # Final transformation matrix
+        return np.dot(A2, np.dot(T, np.dot(R, A1)))
+
+def get_transform3d(origin, x_shift, y_shift, im_scale, yaw, pitch, roll):
+    theta = float(yaw) * math.pi / 180.0
+    phi = float(pitch) * math.pi / 180.0
+    gamma = float(roll) * math.pi / 180.0
+
+    x_origin, y_origin = origin
+    d = np.sqrt((x_origin*2)**2 + (y_origin*2)**2)
+    focal = d / (2 * np.sin(gamma) if np.sin(gamma) != 0 else 1)
+    mat = get_M(x_origin * 2, y_origin * 2, focal, theta, phi, gamma, x_shift, y_shift, focal)
+    mat = np.dot(mat, [[im_scale, 0, 0], [0, im_scale, 0], [0, 0, 1]])
+    inv_mat = np.linalg.inv(mat)
+
+    return (inv_mat.reshape(9, ) / inv_mat[2, 2])[:8]
 
 if __name__ == '__main__':
     main()
