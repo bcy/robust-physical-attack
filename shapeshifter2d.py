@@ -6,6 +6,8 @@
 #
 import os
 import sys
+sys.path.append("../YOLOv3_TensorFlow")
+
 import time
 import math
 import logging
@@ -23,6 +25,10 @@ from shapeshifter import create_attack
 from shapeshifter import create_evaluation
 from shapeshifter import batch_accumulate
 #from shapeshifter import plot
+
+from model import yolov3
+from utils.misc_utils import parse_anchors, read_class_names
+from utils.data_utils import process_box
 
 def main():
     # Parse args
@@ -68,6 +74,15 @@ def main():
     objects_masks = (objects[:, :, :, 3] >= 0.5).astype(np.float32)
     objects = objects[:, :, :, :3]
     assert(objects.shape[:3] == objects_masks.shape[:3])
+
+    # YOLOv3 model related parameters
+    class_name_path = '../YOLOv3_TensorFlow/data/coco.names'
+    anchor_path = '../YOLOv3_TensorFlow/data/yolo_anchors.txt'
+    yolo_checkpoint = '../YOLOv3_TensorFlow/data/darknet_weights/yolov3.ckpt'
+    anchors = parse_anchors(anchor_path)
+    classes = read_class_names(class_name_path)
+    class_num = len(classes)
+    yolo_model = yolov3(class_num, anchors)
 
     # Create test data
     generate_data_partial = partial(generate_data,
@@ -121,7 +136,9 @@ def main():
                                                          'z_range': args.texture_z_range,
                                                          'z_bins': args.texture_z_bins,
                                                          'z_fn': args.texture_z_fn},
-                                    seed=args.seed)
+                                    seed=args.seed,
+                                    class_num=class_num,
+                                    anchors=anchors)
 
     # Create adversarial textures, composite them on object, and pass composites into model. Finally, create summary statistics.
     log.debug("Creating perturbable textures")
@@ -135,9 +152,15 @@ def main():
     log.debug("Creating object detection model")
     predictions, detections, losses = create_model(input_images_, args.model_config, args.model_checkpoint, is_training=True)
 
+    log.debug("Creating YOLOv3 loss")
+    losses_yolo = create_yolo_loss(input_images_, yolo_model, is_training=True)
+
     log.debug("Creating attack losses")
-    victim_class_, target_class_, losses_summary_ = create_attack(textures_, textures_var_, predictions, losses,
-                                                                  optimizer_name=args.optimizer, clip=args.sign_gradients)
+    #victim_class_, target_class_, losses_summary_ = create_attack(textures_, textures_var_, predictions, losses,
+    #                                                              optimizer_name=args.optimizer, clip=args.sign_gradients)
+    victim_class_, target_class_, losses_summary_ = create_attack_2(textures_, textures_var_, predictions, losses,
+                                                                    losses_yolo, optimizer_name=args.optimizer,
+                                                                    clip=args.sign_gradients)
 
     log.debug("Creating evaluation metrics")
     metrics_summary_, texture_summary_ = create_evaluation(victim_class_, target_class_,
@@ -443,7 +466,17 @@ def _apply_blur(image):
     return image_[0]
 """
 
-def generate_data(count, backgrounds, objects, objects_masks, objects_class, objects_transforms, textures_transforms, seed=None):
+def create_yolo_loss(input_images, yolo_model, is_training=False):
+    true_feature_maps = [tf.placeholder(tf.float32, shape=(None, 8), name=f"truth_feature_maps_{i}") for i in range(input_images.shape[0])]
+    pred_feature_maps = []
+    with tf.variable_scope('yolov3'):
+        for i in range(input_images.shape[0]):
+            pred_feature_maps.append(yolo_model.forward(input_images[i], is_training=is_training))
+    losses = [yolo_model.compute_loss(pred_feature_maps[i], true_feature_maps[i]) for i in range(input_images.shape[0])]
+
+    return losses
+
+def generate_data(count, backgrounds, objects, objects_masks, objects_class, objects_transforms, textures_transforms, class_num, anchors, seed=None):
     if seed:
         np.random.seed(seed)
 
@@ -459,6 +492,7 @@ def generate_data(count, backgrounds, objects, objects_masks, objects_class, obj
 
     bboxes = []
     composited_backgrounds = []
+    bboxes2 = []
 
     objects_transforms = generate_transforms(origin, count, **objects_transforms)
 
@@ -501,6 +535,10 @@ def generate_data(count, backgrounds, objects, objects_masks, objects_class, obj
 
         bboxes.append(bbox)
 
+        bbox2 = np.array([[xmin, ymin, xmax, ymax]], dtype=np.float32)
+        bbox2 = np.concatenate((bbox2, np.full(shape=(bbox2.shape[0], 1), fill_value=1., dtype=np.float32)), axis=-1)
+        bboxes2.append(bbox2)
+
     bboxes = np.array(bboxes)
     composited_backgrounds = np.array(composited_backgrounds)
 
@@ -517,11 +555,16 @@ def generate_data(count, backgrounds, objects, objects_masks, objects_class, obj
     transforms = np.reshape(transforms, (-1, 9))
     transforms = transforms[:, :8]
 
+    true_feature_maps = []
+    for bbox in bboxes2:
+        true_feature_maps.append(process_box(bbox, [objects_class - 1], (output_width, output_height), class_num, anchors))
+
     data = {'transforms:0': transforms,
             'backgrounds:0': composited_backgrounds,
             'groundtruth_boxes_%d:0': bboxes,
             'groundtruth_classes_%d:0': np.full(bboxes.shape[0:2], objects_class - 1),
-            'groundtruth_weights_%d:0': np.ones(bboxes.shape[0:2])}
+            'groundtruth_weights_%d:0': np.ones(bboxes.shape[0:2]),
+            'true_feature_maps_%d:0': true_feature_maps}
 
     return data
 
@@ -673,6 +716,289 @@ def get_transform3d(origin, x_shift, y_shift, im_scale, yaw, pitch, roll):
     inv_mat = np.linalg.inv(mat)
 
     return (inv_mat.reshape(9, ) / inv_mat[2, 2])[:8]
+
+
+def create_attack_2(textures, textures_var, predictions, losses, yolo_losses, optimizer_name='gd', clip=False):
+    # Box Classsifier Loss
+    box_cls_weight_ = tf.placeholder_with_default(1.0, [], name='box_cls_weight')
+    box_cls_loss_ = losses['Loss/BoxClassifierLoss/classification_loss']
+    weighted_box_cls_loss_ = tf.multiply(box_cls_loss_, box_cls_weight_, name='box_cls_loss')
+
+    # Box Localizer Loss
+    box_loc_weight_ = tf.placeholder_with_default(2.0, [], name='box_loc_weight')
+    box_loc_loss_ = losses['Loss/BoxClassifierLoss/localization_loss']
+    weighted_box_loc_loss_ = tf.multiply(box_loc_loss_, box_loc_weight_, name='box_loc_loss')
+
+    # RPN Classifier Loss
+    rpn_cls_weight_ = tf.placeholder_with_default(1.0, [], name='rpn_cls_weight')
+    rpn_cls_loss_ = losses['Loss/RPNLoss/objectness_loss']
+    weighted_rpn_cls_loss_ = tf.multiply(rpn_cls_loss_, rpn_cls_weight_, name='rpn_cls_loss')
+
+    # RPN Localizer Loss
+    rpn_loc_weight_ = tf.placeholder_with_default(2.0, [], name='rpn_loc_weight')
+    rpn_loc_loss_ = losses['Loss/RPNLoss/localization_loss']
+    weighted_rpn_loc_loss_ = tf.multiply(rpn_loc_loss_, rpn_loc_weight_, name='rpn_loc_loss')
+
+    # Box Losses
+    target_class_ = tf.placeholder(tf.int32, [], name='target_class')
+    victim_class_ = tf.placeholder(tf.int32, [], name='victim_class')
+    box_iou_thresh_ = tf.placeholder_with_default(0.5, [], name='box_iou_thresh')
+
+    box_logits_ = predictions['class_predictions_with_background']
+    box_logits_ = box_logits_[:, 1:] # Ignore background class
+    victim_one_hot_ = tf.one_hot([victim_class_ - 1], box_logits_.shape[-1])
+    target_one_hot_ = tf.one_hot([target_class_ - 1], box_logits_.shape[-1])
+    box_iou_ = tf.get_default_graph().get_tensor_by_name('Loss/BoxClassifierLoss/Compare/IOU/Select:0')
+    box_iou_ = tf.reshape(box_iou_, (-1,))
+    box_targets_ = tf.cast(box_iou_ >= box_iou_thresh_, tf.float32)
+
+    # Box Victim Loss
+    box_victim_weight_ = tf.placeholder_with_default(0.0, [], name='box_victim_weight')
+
+    box_victim_logits_ = box_logits_[:, victim_class_ - 1]
+    box_victim_loss_ = box_victim_logits_*box_targets_
+    box_victim_loss_ = tf.reduce_sum(box_victim_loss_)
+    weighted_box_victim_loss_ = tf.multiply(box_victim_loss_, box_victim_weight_, name='box_victim_loss')
+
+    # Box Target Loss
+    box_target_weight_ = tf.placeholder_with_default(0.0, [], name='box_target_weight')
+
+    box_target_logits_ = box_logits_[:, target_class_ - 1]
+    box_target_loss_ = box_target_logits_*box_targets_
+    box_target_loss_ = -1*tf.reduce_sum(box_target_loss_) # Maximize!
+    weighted_box_target_loss_ = tf.multiply(box_target_loss_, box_target_weight_, name='box_target_loss')
+
+    # Box Victim CW loss (untargeted, victim -> nonvictim)
+    box_victim_cw_weight_ = tf.placeholder_with_default(0.0, [], name='box_victim_cw_weight')
+    box_victim_cw_conf_ = tf.placeholder_with_default(0.0, [], name='box_victim_cw_conf')
+
+    box_nonvictim_logits_ = tf.reduce_max(box_logits_ * (1 - victim_one_hot_) - 10000*victim_one_hot_, axis=-1)
+    box_victim_cw_loss_ = tf.nn.relu(box_victim_logits_ - box_nonvictim_logits_ + box_victim_cw_conf_)
+    box_victim_cw_loss_ = box_victim_cw_loss_*box_targets_
+    box_victim_cw_loss_ = tf.reduce_sum(box_victim_cw_loss_)
+    weighted_box_victim_cw_loss_ = tf.multiply(box_victim_cw_loss_, box_victim_cw_weight_, name='box_victim_cw_loss')
+
+    # Box Target CW loss (targeted, nontarget -> target)
+    box_target_cw_weight_ = tf.placeholder_with_default(0.0, [], name='box_target_cw_weight')
+    box_target_cw_conf_ = tf.placeholder_with_default(0.0, [], name='box_target_cw_conf')
+
+    box_nontarget_logits_ = tf.reduce_max(box_logits_ * (1 - target_one_hot_) - 10000*target_one_hot_, axis=-1)
+    box_target_cw_loss_ = tf.nn.relu(box_nontarget_logits_ - box_target_logits_ + box_target_cw_conf_)
+    box_target_cw_loss_ = box_target_cw_loss_*box_targets_
+    box_target_cw_loss_ = tf.reduce_sum(box_target_cw_loss_)
+    weighted_box_target_cw_loss_ = tf.multiply(box_target_cw_loss_, box_target_cw_weight_, name='box_target_cw_loss')
+
+    # RPN Losses
+    rpn_iou_thresh_ = tf.placeholder_with_default(0.5, [], name='rpn_iou_thresh')
+    rpn_logits_ = predictions['rpn_objectness_predictions_with_background']
+    rpn_logits_ = tf.reshape(rpn_logits_, (-1, rpn_logits_.shape[-1]))
+    rpn_iou_ = tf.get_default_graph().get_tensor_by_name('Loss/RPNLoss/Compare/IOU/Select:0')
+    rpn_iou_ = tf.reshape(rpn_iou_, (-1,))
+    rpn_targets_ = tf.cast(rpn_iou_ >= rpn_iou_thresh_, tf.float32)
+
+    # RPN Background Loss
+    rpn_background_weight_ = tf.placeholder_with_default(0.0, [], name='rpn_background_weight')
+
+    rpn_background_logits_ = rpn_logits_[:, 0]
+    rpn_background_loss_ = rpn_background_logits_*rpn_targets_
+    rpn_background_loss_ = -1*tf.reduce_sum(rpn_background_loss_) # Maximize!
+    weighted_rpn_background_loss_ = tf.multiply(rpn_background_loss_, rpn_background_weight_, name='rpn_background_loss')
+
+    # RPN Foreground Loss
+    rpn_foreground_weight_ = tf.placeholder_with_default(0.0, [], name='rpn_foreground_weight')
+
+    rpn_foreground_logits_ = rpn_logits_[:, 1]
+    rpn_foreground_loss_ = rpn_foreground_logits_*rpn_targets_
+    rpn_foreground_loss_ = tf.reduce_sum(rpn_foreground_loss_)
+    weighted_rpn_foreground_loss_ = tf.multiply(rpn_foreground_loss_, rpn_foreground_weight_, name='rpn_foreground_loss')
+
+    # RPN CW Loss (un/targeted foreground -> background)
+    rpn_cw_weight_ = tf.placeholder_with_default(0.0, [], name='rpn_cw_weight')
+    rpn_cw_conf_ = tf.placeholder_with_default(0.0, [], name='rpn_cw_conf')
+
+    rpn_cw_loss_ = tf.nn.relu(rpn_foreground_logits_ - rpn_background_logits_ + rpn_cw_conf_)
+    rpn_cw_loss_ = rpn_cw_loss_*rpn_targets_
+    rpn_cw_loss_ = tf.reduce_sum(rpn_cw_loss_)
+    weighted_rpn_cw_loss_ = tf.multiply(rpn_cw_loss_, rpn_cw_weight_, name='rpn_cw_loss')
+
+    # Similiary Loss
+    sim_weight_ = tf.placeholder_with_default(0.0, [], name='sim_weight')
+    initial_textures_ = tf.get_default_graph().get_tensor_by_name('initial_textures:0')
+    sim_loss_ = tf.nn.l2_loss(initial_textures_ - textures)
+    weighted_sim_loss_ = tf.multiply(sim_loss_, sim_weight_, name='sim_loss')
+
+    # YOLO Loss
+    yolo_weight_ = tf.placeholder_with_default(0.0, [], name='yolo_weight')
+    yolo_loss_ = yolo_losses[0]
+    weighted_yolo_loss_ = tf.multiply(yolo_loss_, yolo_weight_, name='yolo_loss')
+
+    loss_ = tf.add_n([weighted_box_cls_loss_, weighted_box_loc_loss_,
+                      weighted_rpn_cls_loss_, weighted_rpn_loc_loss_,
+                      weighted_box_victim_loss_, weighted_box_target_loss_,
+                      weighted_box_victim_cw_loss_, weighted_box_target_cw_loss_,
+                      weighted_rpn_foreground_loss_, weighted_rpn_background_loss_,
+                      weighted_rpn_cw_loss_,
+                      weighted_sim_loss_,
+                      weighted_yolo_loss_], name='loss')
+
+    # Support large batch accumulation metrics
+    total_box_cls_loss_, update_box_cls_loss_ = tf.metrics.mean(losses['Loss/BoxClassifierLoss/classification_loss'])
+    total_box_loc_loss_, update_box_loc_loss_ = tf.metrics.mean(losses['Loss/BoxClassifierLoss/localization_loss'])
+    total_rpn_cls_loss_, update_rpn_cls_loss_ = tf.metrics.mean(losses['Loss/RPNLoss/objectness_loss'])
+    total_rpn_loc_loss_, update_rpn_loc_loss_ = tf.metrics.mean(losses['Loss/RPNLoss/localization_loss'])
+    total_box_target_loss_, update_box_target_loss_ = tf.metrics.mean(box_target_loss_)
+    total_box_victim_loss_, update_box_victim_loss_ = tf.metrics.mean(box_victim_loss_)
+    total_box_target_cw_loss_, update_box_target_cw_loss_ = tf.metrics.mean(box_target_cw_loss_)
+    total_box_victim_cw_loss_, update_box_victim_cw_loss_ = tf.metrics.mean(box_victim_cw_loss_)
+    total_rpn_foreground_loss_, update_rpn_foreground_loss_ = tf.metrics.mean(rpn_foreground_loss_)
+    total_rpn_background_loss_, update_rpn_background_loss_ = tf.metrics.mean(rpn_background_loss_)
+    total_rpn_cw_loss_, update_rpn_cw_loss_ = tf.metrics.mean(rpn_cw_loss_)
+    total_sim_loss_, update_sim_loss_ = tf.metrics.mean(sim_loss_)
+    total_yolo_loss_, update_yolo_loss_ = tf.metrics.mean(yolo_loss_)
+
+    total_weighted_box_cls_loss_ = tf.multiply(total_box_cls_loss_, box_cls_weight_, name='total_box_cls_loss')
+    total_weighted_box_loc_loss_ = tf.multiply(total_box_loc_loss_, box_loc_weight_, name='total_box_loc_loss')
+    total_weighted_rpn_cls_loss_ = tf.multiply(total_rpn_cls_loss_, rpn_cls_weight_, name='total_rpn_cls_loss')
+    total_weighted_rpn_loc_loss_ = tf.multiply(total_rpn_loc_loss_, rpn_loc_weight_, name='total_rpn_loc_loss')
+    total_weighted_box_target_loss_ = tf.multiply(total_box_target_loss_, box_target_weight_, name='total_box_target_loss')
+    total_weighted_box_victim_loss_ = tf.multiply(total_box_victim_loss_, box_victim_weight_, name='total_box_victim_loss')
+    total_weighted_box_target_cw_loss_ = tf.multiply(total_box_target_cw_loss_, box_target_cw_weight_, name='total_box_target_cw_loss')
+    total_weighted_box_victim_cw_loss_ = tf.multiply(total_box_victim_cw_loss_, box_victim_cw_weight_, name='total_box_victim_cw_loss')
+    total_weighted_rpn_background_loss_ = tf.multiply(total_rpn_background_loss_, rpn_background_weight_, name='total_rpn_background_loss')
+    total_weighted_rpn_foreground_loss_ = tf.multiply(total_rpn_foreground_loss_, rpn_foreground_weight_, name='total_rpn_foreground_loss')
+    total_weighted_rpn_cw_loss_ = tf.multiply(total_rpn_cw_loss_, rpn_cw_weight_, name='total_rpn_cw_loss')
+    total_weighted_sim_loss_ = tf.multiply(total_sim_loss_, sim_weight_, name='total_sim_loss')
+    total_weighted_yolo_loss_ = tf.multiply(total_yolo_loss_, yolo_weight_, name='total_yolo_loss')
+
+    total_loss_ = tf.add_n([total_weighted_box_cls_loss_, total_weighted_box_loc_loss_,
+                            total_weighted_rpn_cls_loss_, total_weighted_rpn_loc_loss_,
+                            total_weighted_box_target_loss_, total_weighted_box_victim_loss_,
+                            total_weighted_box_target_cw_loss_, total_weighted_box_victim_cw_loss_,
+                            total_weighted_rpn_foreground_loss_, total_weighted_rpn_background_loss_,
+                            total_weighted_rpn_cw_loss_,
+                            total_weighted_sim_loss_,
+                            total_weighted_yolo_loss_], name='total_loss')
+
+    #tf.summary.scalar('losses/box_cls_weight', box_cls_weight_)
+    tf.summary.scalar('losses/box_cls_loss', total_box_cls_loss_)
+    tf.summary.scalar('losses/box_cls_weighted_loss', total_weighted_box_cls_loss_)
+
+    #tf.summary.scalar('losses/box_loc_weight', box_loc_weight_)
+    tf.summary.scalar('losses/box_loc_loss', total_box_loc_loss_)
+    tf.summary.scalar('losses/box_loc_weighted_loss', total_weighted_box_loc_loss_)
+
+    #tf.summary.scalar('losses/rpn_cls_weight', rpn_cls_weight_)
+    tf.summary.scalar('losses/rpn_cls_loss', total_rpn_cls_loss_)
+    tf.summary.scalar('losses/rpn_cls_weighted_loss', total_weighted_rpn_cls_loss_)
+
+    #tf.summary.scalar('losses/rpn_loc_weight', rpn_loc_weight_)
+    tf.summary.scalar('losses/rpn_loc_loss', total_rpn_loc_loss_)
+    tf.summary.scalar('losses/rpn_loc_weighted_loss', total_weighted_rpn_loc_loss_)
+
+    #tf.summary.scalar('losses/box_target_weight', box_target_weight_)
+    tf.summary.scalar('losses/box_target_loss', total_box_target_loss_)
+    tf.summary.scalar('losses/box_target_weighted_loss', total_weighted_box_target_loss_)
+
+    #tf.summary.scalar('losses/box_victim_weight', box_victim_weight_)
+    tf.summary.scalar('losses/box_victim_loss', total_box_victim_loss_)
+    tf.summary.scalar('losses/box_victim_weighted_loss', total_weighted_box_victim_loss_)
+
+    #tf.summary.scalar('losses/box_target_cw_weight', box_target_cw_weight_)
+    #tf.summary.scalar('losses/box_target_cw_conf', box_target_cw_conf_)
+    tf.summary.scalar('losses/box_target_cw_loss', total_box_target_cw_loss_)
+    tf.summary.scalar('losses/box_target_cw_weighted_loss', total_weighted_box_target_cw_loss_)
+
+    #tf.summary.scalar('losses/box_victim_cw_weight', box_victim_cw_weight_)
+    #tf.summary.scalar('losses/box_victim_cw_conf', box_victim_cw_conf_)
+    tf.summary.scalar('losses/box_victim_cw_loss', total_box_victim_cw_loss_)
+    tf.summary.scalar('losses/box_victim_cw_weighted_loss', total_weighted_box_victim_cw_loss_)
+
+    #tf.summary.scalar('losses/rpn_foreground_weight', rpn_foreground_weight_)
+    tf.summary.scalar('losses/rpn_foreground_loss', total_rpn_foreground_loss_)
+    tf.summary.scalar('losses/rpn_foreground_weighted_loss', total_weighted_rpn_foreground_loss_)
+
+    #tf.summary.scalar('losses/rpn_background_weight', rpn_background_weight_)
+    tf.summary.scalar('losses/rpn_background_loss', total_rpn_background_loss_)
+    tf.summary.scalar('losses/rpn_background_weighted_loss', total_weighted_rpn_background_loss_)
+
+    #tf.summary.scalar('losses/rpn_cw_weight', rpn_cw_weight_)
+    #tf.summary.scalar('losses/rpn_cw_conf', rpn_cw_conf_)
+    tf.summary.scalar('losses/rpn_cw_loss', total_rpn_cw_loss_)
+    tf.summary.scalar('losses/rpn_cw_weighted_loss', total_weighted_rpn_cw_loss_)
+
+    tf.summary.scalar('losses/sim_loss', total_sim_loss_)
+    tf.summary.scalar('losses/sim_weighted_loss', total_weighted_sim_loss_)
+
+    tf.summary.scalar('losses/yolo_loss', total_yolo_loss_)
+    tf.summary.scalar('losses/yolo_weighted_loss', total_weighted_yolo_loss_)
+
+    tf.summary.scalar('loss/loss', total_loss_)
+
+    learning_rate_ = tf.placeholder(tf.float32, [], name='learning_rate')
+    #tf.summary.scalar('hyperparameters/learning_rate', learning_rate_)
+
+    momentum_ = tf.placeholder(tf.float32, [], name='momentum')
+    #tf.summary.scalar('hyperparameters/momentum', momentum_)
+
+    decay_ = tf.placeholder(tf.float32, [], name='decay')
+    #tf.summary.scalar('hyperparameters/decay', decay_)
+
+    optimizer = None
+    if optimizer_name == 'gd':
+        optimizer = tf.train.GradientDescentOptimizer(learning_rate_)
+    elif optimizer_name == 'momentum':
+        optimizer = tf.train.MomentumOptimizer(learning_rate_, momentum=momentum_)
+    elif optimizer_name == 'rmsprop':
+        optimizer = tf.train.RMSPropOptimizer(learning_rate_, momentum=momentum_, decay=decay_)
+    elif optimizer_name == 'adam':
+        optimizer = tf.train.AdamOptimizer(learning_rate_)
+    else:
+        raise Exception("Unknown optimizer: {args.optimizer}")
+
+    global_step_ = tf.train.get_or_create_global_step()
+    grad_ = optimizer.compute_gradients(loss_, var_list=[textures_var])[0][0]
+    grad_ = grad_
+
+    # Create variable to store grad
+    grad_total_ = tf.Variable(tf.zeros_like(textures_var), trainable=False, name='grad_total', collections=[tf.GraphKeys.GLOBAL_VARIABLES, tf.GraphKeys.LOCAL_VARIABLES])
+    grad_count_ = tf.Variable(0., trainable=False, name='grad_count', collections=[tf.GraphKeys.GLOBAL_VARIABLES, tf.GraphKeys.LOCAL_VARIABLES])
+
+    update_grad_total_ = tf.assign_add(grad_total_, grad_)
+    update_grad_count_ = tf.assign_add(grad_count_, 1.)
+
+    grad_ = tf.div(grad_total_, tf.maximum(grad_count_, 1.), name='grad')
+    if clip:
+        grad_ = tf.sign(grad_)
+
+    accum_grad_op_ = tf.group([update_grad_total_, update_grad_count_], name='accum_op')
+
+    grad_vec_ = tf.reshape(grad_, [-1], name='grad_vec')
+    tf.summary.histogram('gradients/all', grad_vec_)
+
+    grad_l1_ = tf.identity(tf.norm(grad_vec_, ord=1), name='grad_l1')
+    tf.summary.scalar('gradients/all_l1', grad_l1_)
+
+    grad_l2_ = tf.identity(tf.norm(grad_vec_, ord=2), name='grad_l2')
+    tf.summary.scalar('gradients/all_l2', grad_l2_)
+
+    grad_linf_ = tf.identity(tf.norm(grad_vec_, ord=np.inf), name='grad_linf')
+    tf.summary.scalar('gradients/all_linf', grad_linf_)
+
+    attack_op_ = optimizer.apply_gradients([(grad_, textures_var)], global_step=global_step_, name='attack_op')
+
+    update_losses_ = tf.stack([update_box_cls_loss_, update_box_loc_loss_,
+                               update_rpn_cls_loss_, update_rpn_loc_loss_,
+                               update_box_target_loss_, update_box_victim_loss_,
+                               update_box_target_cw_loss_, update_box_victim_cw_loss_,
+                               update_rpn_foreground_loss_, update_rpn_background_loss_,
+                               update_rpn_cw_loss_,
+                               update_sim_loss_,
+                               update_yolo_loss_],
+                              name='update_losses_op')
+
+    losses_summary_ = tf.summary.merge_all()
+
+    return victim_class_, target_class_, losses_summary_
 
 if __name__ == '__main__':
     main()
