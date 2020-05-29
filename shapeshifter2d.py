@@ -6,7 +6,7 @@
 #
 import os
 import sys
-sys.path.append("../YOLOv3_TensorFlow")
+sys.path.append("../yolov3")
 
 import time
 import math
@@ -76,13 +76,16 @@ def main():
     assert(objects.shape[:3] == objects_masks.shape[:3])
 
     # YOLOv3 model related parameters
-    class_name_path = '../YOLOv3_TensorFlow/data/coco.names'
-    anchor_path = '../YOLOv3_TensorFlow/data/yolo_anchors.txt'
-    yolo_checkpoint = '../YOLOv3_TensorFlow/data/darknet_weights/yolov3.ckpt'
+    class_name_path = '../yolov3/data/coco.names'
+    anchor_path = '../yolov3/data/yolo_anchors.txt'
+    yolo_checkpoint = '../yolov3/data/darknet_weights/yolov3.ckpt'
     anchors = parse_anchors(anchor_path)
     classes = read_class_names(class_name_path)
     class_num = len(classes)
-    yolo_model = yolov3(class_num, anchors)
+    with tf.name_scope("yolo"):
+        yolo_model = yolov3(class_num, anchors)
+    yolo_varlist = {v.op.name.lstrip("yolo/"): v for v in tf.get_collection(tf.GraphKeys.VARIABLES, scope="yolo/")}
+    yolo_saver = tf.train.Saver(var_list=yolo_varlist)
 
     # Create test data
     generate_data_partial = partial(generate_data,
@@ -204,6 +207,8 @@ def main():
     sess = tf.Session(config=config)
     sess.run(global_init_op_)
     sess.run(local_init_op_)
+
+    yolo_saver.restore(sess, yolo_checkpoint)
 
     # Set initial texture
     if args.checkpoint is not None:
@@ -468,11 +473,9 @@ def _apply_blur(image):
 
 def create_yolo_loss(input_images, yolo_model, is_training=False):
     true_feature_maps = [tf.placeholder(tf.float32, shape=(None, 8), name=f"truth_feature_maps_{i}") for i in range(input_images.shape[0])]
-    pred_feature_maps = []
     with tf.variable_scope('yolov3'):
-        for i in range(input_images.shape[0]):
-            pred_feature_maps.append(yolo_model.forward(input_images[i], is_training=is_training))
-    losses = [yolo_model.compute_loss(pred_feature_maps[i], true_feature_maps[i]) for i in range(input_images.shape[0])]
+        pred_feature_maps = yolo_model.forward(input_images, is_training=is_training)
+    losses = yolo_model.compute_loss(pred_feature_maps, true_feature_maps)
 
     return losses
 
