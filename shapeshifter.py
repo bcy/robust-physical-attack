@@ -182,6 +182,10 @@ def parse_args(texture_yaw_min=0, texture_yaw_max=0,
     group.add_argument('--box-victim-cw-conf', type=float, default=0.)
 
     group.add_argument('--sim-weight', type=float, default=0.)
+    group.add_argument('--yolo-xy-weight', type=float, default=0.)
+    group.add_argument('--yolo-wh-weight', type=float, default=0.)
+    group.add_argument('--yolo-conf-weight', type=float, default=0.)
+    group.add_argument('--yolo-cls-weight', type=float, default=0.)
 
     group = parser.add_argument_group('Metrics')
     group.add_argument('--logdir', type=str)
@@ -283,7 +287,7 @@ def create_model(input_images, pipeline_config_path, fine_tune_checkpoint, is_tr
                                         groundtruth_weights_list=gt_weights)
 
     # Create model pipeline
-    preprocessed_images_, true_image_shapes_  = detection_model.preprocess(255.0*input_images)
+    preprocessed_images_, true_image_shapes_ = detection_model.preprocess(255.0*input_images)
     predictions = detection_model.predict(preprocessed_images_, true_image_shapes_)
     detections = detection_model.postprocess(predictions, true_image_shapes_)
     losses = detection_model.loss(predictions, true_image_shapes_)

@@ -21,7 +21,7 @@ from shapeshifter import parse_args
 from shapeshifter import load_and_tile_images
 from shapeshifter import create_model
 from shapeshifter import create_textures
-from shapeshifter import create_attack
+#from shapeshifter import create_attack
 from shapeshifter import create_evaluation
 from shapeshifter import batch_accumulate
 #from shapeshifter import plot
@@ -75,6 +75,12 @@ def main():
     objects = objects[:, :, :, :3]
     assert(objects.shape[:3] == objects_masks.shape[:3])
 
+    # Create session
+    log.debug("Creating session")
+    config = tf.ConfigProto()
+    config.gpu_options.allow_growth = True
+    sess = tf.Session(config=config)
+
     # YOLOv3 model related parameters
     class_name_path = '../yolov3/data/coco.names'
     anchor_path = '../yolov3/data/yolo_anchors.txt'
@@ -82,10 +88,7 @@ def main():
     anchors = parse_anchors(anchor_path)
     classes = read_class_names(class_name_path)
     class_num = len(classes)
-    with tf.name_scope("yolo"):
-        yolo_model = yolov3(class_num, anchors)
-    yolo_varlist = {v.op.name.lstrip("yolo/"): v for v in tf.get_collection(tf.GraphKeys.VARIABLES, scope="yolo/")}
-    yolo_saver = tf.train.Saver(var_list=yolo_varlist)
+    yolo_model = yolov3(class_num, anchors)
 
     # Create test data
     generate_data_partial = partial(generate_data,
@@ -156,7 +159,8 @@ def main():
     predictions, detections, losses = create_model(input_images_, args.model_config, args.model_checkpoint, is_training=True)
 
     log.debug("Creating YOLOv3 loss")
-    losses_yolo = create_yolo_loss(input_images_, yolo_model, is_training=True)
+    height, width = backgrounds.shape[1:3]
+    losses_yolo, yolo_varlist = create_yolo_loss(input_images_, (height, width), yolo_model, class_num, is_training=True)
 
     log.debug("Creating attack losses")
     #victim_class_, target_class_, losses_summary_ = create_attack(textures_, textures_var_, predictions, losses,
@@ -199,15 +203,10 @@ def main():
         checkpoint_path = tf.train.latest_checkpoint(args.logdir + '/checkpoints')
         args.checkpoint = checkpoint_path
 
-    # Create session
-    log.debug("Creating session")
-    config = tf.ConfigProto()
-    config.gpu_options.allow_growth = True
-
-    sess = tf.Session(config=config)
     sess.run(global_init_op_)
     sess.run(local_init_op_)
 
+    yolo_saver = tf.train.Saver(var_list=yolo_varlist)
     yolo_saver.restore(sess, yolo_checkpoint)
 
     # Set initial texture
@@ -223,7 +222,7 @@ def main():
             log.debug(f"Adding uniform random perturbation texture with at most {args.random_start}/255 per pixel")
             textures = textures + np.random.randint(size=textures.shape, low=-args.random_start, high=args.random_start)/255
 
-        sess.run('project_op', { 'textures:0': textures  })
+        sess.run('project_op', {'textures:0': textures})
 
     # Get global step
     step = sess.run('global_step:0')
@@ -243,6 +242,10 @@ def main():
                     'total_box_target_loss:0', 'total_box_victim_loss:0',
                     'total_box_target_cw_loss:0', 'total_box_victim_cw_loss:0',
                     'total_sim_loss:0',
+                    'total_yolo_xy_loss:0',
+                    'total_yolo_wh_loss:0',
+                    'total_yolo_conf_loss:0',
+                    'total_yolo_cls_loss:0',
                     'grad_l2:0', 'grad_linf:0']
 
     metric_tensors = ['proposal_average_precision:0', 'victim_average_precision:0', 'target_average_precision:0']
@@ -274,6 +277,10 @@ def main():
                        'box_victim_cw_conf:0': args.box_victim_cw_conf,
 
                        'sim_weight:0': args.sim_weight,
+                       'yolo_xy_weight:0': args.yolo_xy_weight,
+                       'yolo_wh_weight:0': args.yolo_wh_weight,
+                       'yolo_conf_weight:0': args.yolo_conf_weight,
+                       'yolo_cls_weight:0': args.yolo_cls_weight,
 
                        'victim_class:0': args.victim_class,
                        'target_class:0': args.target_class }
@@ -471,13 +478,28 @@ def _apply_blur(image):
     return image_[0]
 """
 
-def create_yolo_loss(input_images, yolo_model, is_training=False):
-    true_feature_maps = [tf.placeholder(tf.float32, shape=(None, 8), name=f"truth_feature_maps_{i}") for i in range(input_images.shape[0])]
+def create_yolo_loss(input_images, img_size, yolo_model, class_num, is_training=False):
+    true_feature_maps_13 = [tf.placeholder(tf.float32, (img_size[0] // 32, img_size[1] // 32, 3, 6 + class_num),
+                                           name=f"true_feature_maps_13_{i}") for i in range(input_images.shape[0])]
+    true_feature_maps_26 = [tf.placeholder(tf.float32, (img_size[0] // 16, img_size[1] // 16, 3, 6 + class_num),
+                                           name=f"true_feature_maps_26_{i}") for i in range(input_images.shape[0])]
+    true_feature_maps_52 = [tf.placeholder(tf.float32, (img_size[0] // 8, img_size[1] // 8, 3, 6 + class_num),
+                                           name=f"true_feature_maps_52_{i}") for i in range(input_images.shape[0])]
+    input_imgs = tf.identity(input_images)
+    input_imgs.set_shape([None, img_size[0], img_size[1], 3])
     with tf.variable_scope('yolov3'):
-        pred_feature_maps = yolo_model.forward(input_images, is_training=is_training)
+        pred_feature_maps = yolo_model.forward(input_imgs, is_training=is_training)
+    yolo_varlist = tf.global_variables(scope='yolov3')
+
+    true_feature_maps_13 = tf.convert_to_tensor(true_feature_maps_13, dtype=tf.float32)
+    true_feature_maps_26 = tf.convert_to_tensor(true_feature_maps_26, dtype=tf.float32)
+    true_feature_maps_52 = tf.convert_to_tensor(true_feature_maps_52, dtype=tf.float32)
+    true_feature_maps = [true_feature_maps_13, true_feature_maps_26, true_feature_maps_52]
+    for y in true_feature_maps:
+        y.set_shape([None, None, None, None, None])
     losses = yolo_model.compute_loss(pred_feature_maps, true_feature_maps)
 
-    return losses
+    return losses, yolo_varlist
 
 def generate_data(count, backgrounds, objects, objects_masks, objects_class, objects_transforms, textures_transforms, class_num, anchors, seed=None):
     if seed:
@@ -558,16 +580,25 @@ def generate_data(count, backgrounds, objects, objects_masks, objects_class, obj
     transforms = np.reshape(transforms, (-1, 9))
     transforms = transforms[:, :8]
 
-    true_feature_maps = []
+    true_feature_maps_13 = []
+    true_feature_maps_26 = []
+    true_feature_maps_52 = []
     for bbox in bboxes2:
-        true_feature_maps.append(process_box(bbox, [objects_class - 1], (output_width, output_height), class_num, anchors))
+        true_feature_map_13, true_feature_map_26, true_feature_map_52 = \
+            process_box(bbox, [objects_class - 1], (output_width, output_height), class_num, anchors)
+        true_feature_maps_13.append(true_feature_map_13)
+        true_feature_maps_26.append(true_feature_map_26)
+        true_feature_maps_52.append(true_feature_map_52)
 
     data = {'transforms:0': transforms,
             'backgrounds:0': composited_backgrounds,
             'groundtruth_boxes_%d:0': bboxes,
             'groundtruth_classes_%d:0': np.full(bboxes.shape[0:2], objects_class - 1),
             'groundtruth_weights_%d:0': np.ones(bboxes.shape[0:2]),
-            'true_feature_maps_%d:0': true_feature_maps}
+            'true_feature_maps_13_%d:0': true_feature_maps_13,
+            'true_feature_maps_26_%d:0': true_feature_maps_26,
+            'true_feature_maps_52_%d:0': true_feature_maps_52,
+            }
 
     return data
 
@@ -831,9 +862,29 @@ def create_attack_2(textures, textures_var, predictions, losses, yolo_losses, op
     weighted_sim_loss_ = tf.multiply(sim_loss_, sim_weight_, name='sim_loss')
 
     # YOLO Loss
-    yolo_weight_ = tf.placeholder_with_default(0.0, [], name='yolo_weight')
-    yolo_loss_ = yolo_losses[0]
-    weighted_yolo_loss_ = tf.multiply(yolo_loss_, yolo_weight_, name='yolo_loss')
+    #yolo_weight_ = tf.placeholder_with_default(0.0, [], name='yolo_weight')
+    #yolo_loss_ = yolo_losses[0]
+    #weighted_yolo_loss_ = tf.multiply(yolo_loss_, yolo_weight_, name='yolo_loss')
+
+    # YOLO xy loss
+    yolo_xy_weight_ = tf.placeholder_with_default(0.0, [], name='yolo_xy_weight')
+    yolo_xy_loss_ = yolo_losses[1]
+    weighted_yolo_xy_loss_ = tf.multiply(yolo_xy_loss_, yolo_xy_weight_, name='yolo_xy_loss')
+
+    # YOLO wh loss
+    yolo_wh_weight_ = tf.placeholder_with_default(0.0, [], name='yolo_wh_weight')
+    yolo_wh_loss_ = yolo_losses[2]
+    weighted_yolo_wh_loss_ = tf.multiply(yolo_wh_loss_, yolo_wh_weight_, name='yolo_wh_loss')
+
+    # YOLO conf loss
+    yolo_conf_weight_ = tf.placeholder_with_default(0.0, [], name='yolo_conf_weight')
+    yolo_conf_loss_ = yolo_losses[3]
+    weighted_yolo_conf_loss_ = tf.multiply(yolo_conf_loss_, yolo_conf_weight_, name='yolo_conf_loss')
+
+    # YOLO cls loss
+    yolo_cls_weight_ = tf.placeholder_with_default(0.0, [], name='yolo_cls_weight')
+    yolo_cls_loss_ = yolo_losses[4]
+    weighted_yolo_cls_loss_ = tf.multiply(yolo_cls_loss_, yolo_cls_weight_, name='yolo_cls_loss')
 
     loss_ = tf.add_n([weighted_box_cls_loss_, weighted_box_loc_loss_,
                       weighted_rpn_cls_loss_, weighted_rpn_loc_loss_,
@@ -842,7 +893,8 @@ def create_attack_2(textures, textures_var, predictions, losses, yolo_losses, op
                       weighted_rpn_foreground_loss_, weighted_rpn_background_loss_,
                       weighted_rpn_cw_loss_,
                       weighted_sim_loss_,
-                      weighted_yolo_loss_], name='loss')
+                      weighted_yolo_xy_loss_, weighted_yolo_wh_loss_,
+                      weighted_yolo_conf_loss_, weighted_yolo_cls_loss_], name='loss')
 
     # Support large batch accumulation metrics
     total_box_cls_loss_, update_box_cls_loss_ = tf.metrics.mean(losses['Loss/BoxClassifierLoss/classification_loss'])
@@ -857,7 +909,11 @@ def create_attack_2(textures, textures_var, predictions, losses, yolo_losses, op
     total_rpn_background_loss_, update_rpn_background_loss_ = tf.metrics.mean(rpn_background_loss_)
     total_rpn_cw_loss_, update_rpn_cw_loss_ = tf.metrics.mean(rpn_cw_loss_)
     total_sim_loss_, update_sim_loss_ = tf.metrics.mean(sim_loss_)
-    total_yolo_loss_, update_yolo_loss_ = tf.metrics.mean(yolo_loss_)
+    #total_yolo_loss_, update_yolo_loss_ = tf.metrics.mean(yolo_loss_)
+    total_yolo_xy_loss_, update_yolo_xy_loss_ = tf.metrics.mean(yolo_xy_loss_)
+    total_yolo_wh_loss_, update_yolo_wh_loss_ = tf.metrics.mean(yolo_wh_loss_)
+    total_yolo_conf_loss_, update_yolo_conf_loss_ = tf.metrics.mean(yolo_conf_loss_)
+    total_yolo_cls_loss_, update_yolo_cls_loss_ = tf.metrics.mean(yolo_cls_loss_)
 
     total_weighted_box_cls_loss_ = tf.multiply(total_box_cls_loss_, box_cls_weight_, name='total_box_cls_loss')
     total_weighted_box_loc_loss_ = tf.multiply(total_box_loc_loss_, box_loc_weight_, name='total_box_loc_loss')
@@ -871,7 +927,11 @@ def create_attack_2(textures, textures_var, predictions, losses, yolo_losses, op
     total_weighted_rpn_foreground_loss_ = tf.multiply(total_rpn_foreground_loss_, rpn_foreground_weight_, name='total_rpn_foreground_loss')
     total_weighted_rpn_cw_loss_ = tf.multiply(total_rpn_cw_loss_, rpn_cw_weight_, name='total_rpn_cw_loss')
     total_weighted_sim_loss_ = tf.multiply(total_sim_loss_, sim_weight_, name='total_sim_loss')
-    total_weighted_yolo_loss_ = tf.multiply(total_yolo_loss_, yolo_weight_, name='total_yolo_loss')
+    #total_weighted_yolo_loss_ = tf.multiply(total_yolo_loss_, yolo_weight_, name='total_yolo_loss')
+    total_weighted_yolo_xy_loss_ = tf.multiply(total_yolo_xy_loss_, yolo_xy_weight_, name='total_yolo_xy_loss')
+    total_weighted_yolo_wh_loss_ = tf.multiply(total_yolo_wh_loss_, yolo_wh_weight_, name='total_yolo_wh_loss')
+    total_weighted_yolo_conf_loss_ = tf.multiply(total_yolo_conf_loss_, yolo_conf_weight_, name='total_yolo_conf_loss')
+    total_weighted_yolo_cls_loss_ = tf.multiply(total_yolo_cls_loss_, yolo_cls_weight_, name='total_yolo_cls_loss')
 
     total_loss_ = tf.add_n([total_weighted_box_cls_loss_, total_weighted_box_loc_loss_,
                             total_weighted_rpn_cls_loss_, total_weighted_rpn_loc_loss_,
@@ -880,7 +940,8 @@ def create_attack_2(textures, textures_var, predictions, losses, yolo_losses, op
                             total_weighted_rpn_foreground_loss_, total_weighted_rpn_background_loss_,
                             total_weighted_rpn_cw_loss_,
                             total_weighted_sim_loss_,
-                            total_weighted_yolo_loss_], name='total_loss')
+                            total_weighted_yolo_xy_loss_, total_weighted_yolo_wh_loss_,
+                            total_weighted_yolo_conf_loss_, total_weighted_yolo_cls_loss_], name='total_loss')
 
     #tf.summary.scalar('losses/box_cls_weight', box_cls_weight_)
     tf.summary.scalar('losses/box_cls_loss', total_box_cls_loss_)
@@ -932,8 +993,20 @@ def create_attack_2(textures, textures_var, predictions, losses, yolo_losses, op
     tf.summary.scalar('losses/sim_loss', total_sim_loss_)
     tf.summary.scalar('losses/sim_weighted_loss', total_weighted_sim_loss_)
 
-    tf.summary.scalar('losses/yolo_loss', total_yolo_loss_)
-    tf.summary.scalar('losses/yolo_weighted_loss', total_weighted_yolo_loss_)
+    #tf.summary.scalar('losses/yolo_loss', total_yolo_loss_)
+    #tf.summary.scalar('losses/yolo_weighted_loss', total_weighted_yolo_loss_)
+
+    tf.summary.scalar('losses/yolo_xy_loss', total_yolo_xy_loss_)
+    tf.summary.scalar('losses/yolo_weighted_xy_loss', total_weighted_yolo_xy_loss_)
+
+    tf.summary.scalar('losses/yolo_wh_loss', total_yolo_wh_loss_)
+    tf.summary.scalar('losses/yolo_weighted_wh_loss', total_weighted_yolo_wh_loss_)
+
+    tf.summary.scalar('losses/yolo_conf_loss', total_yolo_conf_loss_)
+    tf.summary.scalar('losses/yolo_weighted_conf_loss', total_weighted_yolo_conf_loss_)
+
+    tf.summary.scalar('losses/yolo_cls_loss', total_yolo_cls_loss_)
+    tf.summary.scalar('losses/yolo_weighted_cls_loss', total_weighted_yolo_cls_loss_)
 
     tf.summary.scalar('loss/loss', total_loss_)
 
@@ -996,7 +1069,10 @@ def create_attack_2(textures, textures_var, predictions, losses, yolo_losses, op
                                update_rpn_foreground_loss_, update_rpn_background_loss_,
                                update_rpn_cw_loss_,
                                update_sim_loss_,
-                               update_yolo_loss_],
+                               update_yolo_xy_loss_,
+                               update_yolo_wh_loss_,
+                               update_yolo_conf_loss_,
+                               update_yolo_cls_loss_],
                               name='update_losses_op')
 
     losses_summary_ = tf.summary.merge_all()
